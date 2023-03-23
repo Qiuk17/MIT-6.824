@@ -56,7 +56,7 @@ func loadPlugin(filename string) (func(string, string) []KeyValue, func(string, 
 // main/mrworker.go calls this function.
 func Worker(pluginName string) {
 
-	mapf, _ := loadPlugin(pluginName)
+	mapf, reducef := loadPlugin(pluginName)
 
 	var registerResp RegisterWorkerResponse
 	call("Coordinator.RegisterWorker", RegisterWorkerRequest{}, &registerResp)
@@ -82,7 +82,7 @@ func Worker(pluginName string) {
 		if getJobResponse.Type == JobMap {
 			runMap(registerResp.WorkerId, getJobResponse.Key, getJobResponse.NumReduce, mapf)
 		} else {
-			runReduce(registerResp.WorkerId, getJobResponse.WorkerIds, getJobResponse.Key)
+			runReduce(registerResp.WorkerId, getJobResponse.WorkerIds, getJobResponse.Key, reducef)
 		}
 
 		var nResp JobDoneNotificationResponse
@@ -96,7 +96,7 @@ func Worker(pluginName string) {
 }
 
 func intermediateName(mapKey string, reduceKey int, workerId int) string {
-	return fmt.Sprintf("temp-%d-%d-%s", workerId, reduceKey, mapKey)
+	return fmt.Sprintf("mrtmp-%d-%d-%d", workerId, reduceKey, ihash(mapKey))
 }
 
 func getIntermediateNames(reduceKey string, workerIds []int) []string {
@@ -107,17 +107,14 @@ func getIntermediateNames(reduceKey string, workerIds []int) []string {
 		workers[id] = struct{}{}
 	}
 
-	log.Printf("read map results(reduceKey=%s)", reduceKey)
-
 	dirs, err := os.ReadDir("./")
 	if err != nil {
-		panic("cannot read dir")
+		log.Fatal("cannot read dir")
 	}
 	for workerId := range workers {
-		reg := regexp.MustCompile(fmt.Sprintf("temp-%d-%s.*", workerId, reduceKey))
+		reg := regexp.MustCompile(fmt.Sprintf("mrtmp-%d-%s.*", workerId, reduceKey))
 		for _, dir := range dirs {
 			if reg.Match([]byte(dir.Name())) {
-				log.Print(dir.Name())
 				ret = append(ret, dir.Name())
 			}
 		}
@@ -141,14 +138,14 @@ func runMap(workerId int, key string, nReduce int, mapf func(string, string) []K
 	for i := 0; i < nReduce; i++ {
 		outputFiles[i], err = os.Create(intermediateName(key, i, workerId))
 		if err != nil {
-			return err
+			log.Fatal(err)
 		}
 	}
 
 	for _, kv := range kva {
 		_, err = fmt.Fprintf(outputFiles[ihash(kv.Key)%nReduce], "%s %s\n", kv.Key, kv.Value)
 		if err != nil {
-			return err
+			log.Fatal(err)
 		}
 	}
 
@@ -159,7 +156,7 @@ func runMap(workerId int, key string, nReduce int, mapf func(string, string) []K
 	return nil
 }
 
-func runReduce(workerId int, mapWorkerIds []int, reduceKey string) {
+func runReduce(workerId int, mapWorkerIds []int, reduceKey string, reducef func(string, []string) string) {
 	files := getIntermediateNames(reduceKey, mapWorkerIds)
 	intermediates := []KeyValue{}
 
@@ -175,9 +172,30 @@ func runReduce(workerId int, mapWorkerIds []int, reduceKey string) {
 			intermediates = append(intermediates, kv)
 		}
 		ofile.Close()
-
-		sort.Sort(ByKey(intermediates))
 	}
+
+	sort.Sort(ByKey(intermediates))
+	ofile, _ := os.Create(fmt.Sprintf("mr-out-%s", reduceKey))
+
+	// copyed from src/main/mrsequencial.go
+	i := 0
+	for i < len(intermediates) {
+		j := i + 1
+		for j < len(intermediates) && intermediates[j].Key == intermediates[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediates[k].Value)
+		}
+		output := reducef(intermediates[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediates[i].Key, output)
+
+		i = j
+	}
+	ofile.Close()
 }
 
 // send an RPC request to the coordinator, wait for the response.
