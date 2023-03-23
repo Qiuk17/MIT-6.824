@@ -8,16 +8,40 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"os"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/sirupsen/logrus"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
+
+type TestInstanceHook struct {
+	testId uint
+}
+
+func (h *TestInstanceHook) Levels() []logrus.Level {
+	return logrus.AllLevels
+}
+
+func (h *TestInstanceHook) Fire(entry *logrus.Entry) error {
+	entry.Data["test_id"] = h.testId
+	return nil
+}
+
+func TestMain(m *testing.M) {
+	hook := TestInstanceHook{uint(time.Now().UnixMilli())}
+	logrus.AddHook(&hook)
+	os.Exit(m.Run())
+}
 
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
