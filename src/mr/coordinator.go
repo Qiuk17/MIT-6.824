@@ -6,74 +6,155 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
 
-const JobQueueCap int = 100
-
-type JobStatus int
-
-const (
-	NotAssigned JobStatus = iota
-	Running
-	Done
-)
+const JobQueueCap = 100
+const JobMaxExecutionDuration = 10 * time.Second
 
 type JobState struct {
-	Type       JobType
-	Key        string
-	Status     JobStatus
-	AssignedTo *WorkerState
-}
-
-type WorkerState struct {
-	WorkerId     int
-	AssignedTask *JobState
+	Type JobType
+	Key  string
 }
 
 type Coordinator struct {
-	// Your definitions here.
-	workerIdCnt int
+	nReduce int
+	nMap    int
 
-	workersMutex sync.Mutex
-	Workers      map[int]*WorkerState
+	mapWaitGroup    sync.WaitGroup
+	reduceWaitGroup sync.WaitGroup
 
-	UndoneJobsChan chan *JobState
+	workerIdCntMutex sync.Mutex
+	workerIdCnt      int
+
+	undoneJobsChan chan *JobState
+
+	runningJobDonesChanMutex sync.Mutex
+	runningJobDonesChan      map[string]chan interface{}
+
+	workerIdsDoneMapJobsMutex sync.Mutex
+	workerIdsDoneMapJobs      []int
+
+	allDone bool
 }
 
 func (c *Coordinator) RegisterWorker(req RegisterWorkerRequest, resp *RegisterWorkerResponse) error {
-	c.workersMutex.Lock()
-	defer c.workersMutex.Unlock()
+	c.workerIdCntMutex.Lock()
+	defer c.workerIdCntMutex.Unlock()
 
-	c.Workers[c.workerIdCnt] = &WorkerState{
-		WorkerId:     c.workerIdCnt,
-		AssignedTask: nil,
-	}
 	resp.WorkerId = c.workerIdCnt
 	c.workerIdCnt = c.workerIdCnt + 1
 
 	log.Printf("worker(id=%d) registered", resp.WorkerId)
-	time.Sleep(5 * time.Second)
 	return nil
 }
 
 func (c *Coordinator) GetJob(req GetJobRequest, resp *GetJobResponse) error {
+	select {
+	case job := <-c.undoneJobsChan:
+		resp.Type = job.Type
+		resp.Key = job.Key
+		resp.NumReduce = c.nReduce
+		if job.Type == JobReduce {
+			log.Print(c.workerIdsDoneMapJobs)
+			resp.WorkerIds = c.workerIdsDoneMapJobs
+		}
+		log.Printf("worker(id=%d) gets job(key=%s)", req.WorkerId, job.Key)
 
+		c.runningJobDonesChanMutex.Lock()
+		defer c.runningJobDonesChanMutex.Unlock()
+		c.runningJobDonesChan[job.Key] = make(chan interface{})
+		go c.watchRunningJob(job, req.WorkerId)
+
+	default:
+		resp.Type = JobNothing
+	}
+
+	return nil
+}
+
+func (c *Coordinator) NotifyJobDone(notification JobDoneNotification, resp *JobDoneNotificationResponse) error {
+	c.runningJobDonesChanMutex.Lock()
+	defer c.runningJobDonesChanMutex.Unlock()
+
+	log.Printf("recv job() done notification")
+
+	done, exists := c.runningJobDonesChan[notification.Key]
+	if exists {
+		close(done)
+		resp.Ok = true
+	} else {
+		resp.Ok = false
+	}
 	return nil
 }
 
 func (c *Coordinator) initMapJobs(files []string) {
 	for _, file := range files {
-		c.UndoneJobsChan <- &JobState{
-			Type:       JobMap,
-			Key:        file,
-			Status:     NotAssigned,
-			AssignedTo: nil,
+		c.undoneJobsChan <- &JobState{
+			Type: JobMap,
+			Key:  file,
+		}
+		log.Printf("add task(key=%s)", file)
+		c.mapWaitGroup.Add(1)
+	}
+
+	// wait for all map jobs to be done
+	go func() {
+		c.mapWaitGroup.Wait()
+		log.Print("map done. adding reduce jobs")
+		c.initReduceJobs(c.nReduce)
+	}()
+}
+
+func (c *Coordinator) initReduceJobs(nReduce int) {
+	for i := 0; i < nReduce; i++ {
+		c.undoneJobsChan <- &JobState{
+			Type: JobReduce,
+			Key:  strconv.FormatInt(int64(i), 10),
+		}
+		log.Printf("add task(key=%d)", i)
+		c.reduceWaitGroup.Add(1)
+	}
+
+	go func() {
+		c.reduceWaitGroup.Wait()
+		log.Print("reduce done. quitting")
+		c.allDone = true
+	}()
+}
+
+func (c *Coordinator) watchRunningJob(job *JobState, workerId int) {
+
+	log.Printf("start to watch job(key=%s)", job.Key)
+
+	select {
+	case <-c.runningJobDonesChan[job.Key]:
+		// job Done
+		log.Printf("watch job(key=%s) done", job.Key)
+
+		switch job.Type {
+		case JobMap:
+			c.workerIdsDoneMapJobsMutex.Lock()
+			defer c.workerIdsDoneMapJobsMutex.Unlock()
+			c.workerIdsDoneMapJobs = append(c.workerIdsDoneMapJobs, workerId)
+			c.mapWaitGroup.Done()
+
+		case JobReduce:
+			c.reduceWaitGroup.Done()
 		}
 
-		log.Printf("add task(key=%s)", file)
+	case <-time.After(JobMaxExecutionDuration):
+		// timeout
+		c.undoneJobsChan <- job
+		log.Printf("job(key=%s) timeout", job.Key)
 	}
+
+	c.runningJobDonesChanMutex.Lock()
+	defer c.runningJobDonesChanMutex.Unlock()
+	delete(c.runningJobDonesChan, job.Key)
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -93,11 +174,7 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	return c.allDone
 }
 
 // create a Coordinator.
@@ -106,13 +183,15 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	log.SetPrefix("[c] ")
 	c := Coordinator{
-		workerIdCnt:    0,
-		UndoneJobsChan: make(chan *JobState, JobQueueCap),
-		Workers:        make(map[int]*WorkerState, 5),
+		workerIdCnt:          0,
+		nMap:                 len(files),
+		nReduce:              nReduce,
+		undoneJobsChan:       make(chan *JobState, JobQueueCap),
+		workerIdsDoneMapJobs: make([]int, 0),
+		runningJobDonesChan:  make(map[string]chan interface{}),
+		allDone:              false,
 	}
 	c.initMapJobs(files)
-	// Your code here.
-
 	c.server()
 	return &c
 }

@@ -30,6 +30,8 @@ type JobType int
 const (
 	JobMap JobType = iota
 	JobReduce
+	JobNothing
+	JobExit
 )
 
 type GetJobRequest struct {
@@ -37,14 +39,30 @@ type GetJobRequest struct {
 }
 
 type GetJobResponse struct {
-	Type            JobType
-	Key             string
-	MapDoneOnWorker []int
+	Type JobType
+	Key  string
+
+	// type JobMap only
+	NumReduce int
+
+	// type JobReduce only
+	WorkerIds []int
+}
+
+type GetWorkerIdRunMapJobsRequest struct {
+}
+
+type GetWorkerIdRunMapJobsResponse struct {
 }
 
 type JobDoneNotification struct {
-	JobId          int
-	OutputFileName string
+	WorkerId int
+	Type     JobType
+	Key      string
+}
+
+type JobDoneNotificationResponse struct {
+	Ok bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name
